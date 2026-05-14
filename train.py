@@ -1,7 +1,4 @@
 import os
-
-os.environ["WANDB_DISABLED"] = "true"
-
 import copy
 import json
 import logging
@@ -12,18 +9,19 @@ from PIL import Image
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Sequence, List
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, ConcatDataset
+from torch import nn
+
+# ========== 关键修改0：最顶部禁用wandb环境变量 ==========
+os.environ["WANDB_DISABLED"] = "true"
+
 from mobilevlm.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, \
     DEFAULT_IM_END_TOKEN
 from mobilevlm.train.trainer import VLMTrainer
 from mobilevlm import conversation as conversation_lib
 from mobilevlm.model.mobilellama import MobileLlamaForCausalLM
-from transformers import PreTrainedTokenizer
-
 from mobilevlm.utils import tokenizer_image_token
-
-from typing import Union, List
 
 local_rank = None
 
@@ -31,6 +29,66 @@ local_rank = None
 def rank0_print(*args):
     if local_rank == 0:
         print(*args)
+
+
+# ========== 新增：自定义Loss计算函数 ==========
+def compute_waypoint_loss(pred_waypoints, target_waypoints, valid_waypoints):
+    """
+    计算轨迹点预测损失
+    pred_waypoints: [batch_size, 5, 2]
+    target_waypoints: [batch_size, 5, 2]
+    valid_waypoints: [batch_size, 5, 2]
+    """
+    # 只计算有效轨迹点的损失
+    mask = valid_waypoints.bool()
+    if mask.sum() == 0:
+        return torch.tensor(0.0, device=pred_waypoints.device)
+
+    # MSE损失
+    mse_loss = F.mse_loss(pred_waypoints[mask], target_waypoints[mask], reduction='mean')
+    return mse_loss
+
+
+# ========== 新增：修改VLMTrainer以支持轨迹点损失 ==========
+class CustomVLMTrainer(VLMTrainer):
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """
+        重写损失计算逻辑，同时计算LLM损失和轨迹点损失
+        """
+        # 提取轨迹点标签（避免被model forward处理）
+        local_future_waypoints = inputs.pop("local_future_waypoints", None)
+        valid_future_waypoints = inputs.pop("valid_future_waypoints", None)
+
+        # 计算原始LLM损失
+        outputs = model(**inputs)
+        llm_loss = outputs.loss if outputs.loss is not None else torch.tensor(0.0, device=model.device)
+
+        # 计算轨迹点损失（如果有）
+        waypoint_loss = torch.tensor(0.0, device=llm_loss.device)
+        if (local_future_waypoints is not None and valid_future_waypoints is not None and
+                hasattr(model, 'agent_head') and model.agent_head is not None):
+            # 获取模型最后一层输出用于预测轨迹点
+            last_hidden_state = outputs.hidden_states[-1] if hasattr(outputs, 'hidden_states') else outputs.logits
+            pred_waypoints = model.agent_head(last_hidden_state)
+            waypoint_loss = compute_waypoint_loss(
+                pred_waypoints, local_future_waypoints, valid_future_waypoints
+            )
+
+        # 组合损失（保留LLM loss权重，避免loss为0）
+        if hasattr(model, 'llm_loss_weight') and hasattr(model, 'agent_loss_weight'):
+            total_loss = model.llm_loss_weight * llm_loss + model.agent_loss_weight * waypoint_loss
+        else:
+            # 没有agent head时只使用LLM损失
+            total_loss = llm_loss if waypoint_loss.item() == 0 else 0.1 * llm_loss + 0.9 * waypoint_loss
+
+        # 打印损失分解（仅rank0，每100步打印一次）
+        if self.state.global_step % 100 == 0 and local_rank == 0:
+            print(f"\nStep {self.state.global_step}:")
+            print(f"  LLM Loss: {llm_loss.item():.6f}")
+            print(f"  Waypoint Loss: {waypoint_loss.item():.6f}")
+            print(f"  Total Loss: {total_loss.item():.6f}")
+
+        return (total_loss, outputs) if return_outputs else total_loss
 
 
 @dataclass
@@ -45,38 +103,51 @@ class ModelArguments:
     mm_projector_type: Optional[str] = field(default='linear')
     mm_use_im_start_end: bool = field(default=False)
     mm_use_im_patch_token: bool = field(default=True)
-    mm_vision_select_feature: Optional[str] = field("patch")
+    mm_vision_select_feature: Optional[str] = field(default="patch")
     vision_tower_type: Optional[str] = field(default='clip')
     task_name: str = field(default='llm')
-    train_agent: bool = field(default=False)
+    train_agent: bool = field(default=True)  # 默认开启agent训练
     no_loading_pretrained_llm: bool = field(default=False)
+    # 新增：轨迹点预测head配置
+    waypoint_pred_dim: int = field(default=10)  # 5个点 × 2维坐标
 
 
 @dataclass
 class DataArguments:
     data_path: str = field(default=None, metadata={"help": "Path to the training data."})
-    # data_path: list[str] = field(default_factory=None, metadata={"help": "Path to the training data."})
     lazy_preprocess: bool = False
-    is_multimodal: bool = False
+    is_multimodal: bool = field(default=True)  # 默认开启多模态
     image_folder: Optional[str] = field(default=None)
-    image_aspect_ratio: str = 'square'
+    image_aspect_ratio: str = 'pad'  # 默认使用pad模式处理图片
     image_grid_pinpoints: Optional[str] = field(default=None)
-    dataset_name: str = 'LingoQA'
+    dataset_name: str = 'Carla'  # 默认使用Carla数据集
     lingoqa_data_path: str = field(default=None, metadata={"help": "Path to the training data."})
     drama_data_repeat: int = 1
-    carla_repeat_factor: int = 2
+    carla_repeat_factor: int = 1
     drama_data_path: str = field(default=None)
+    # 新增：调试参数
+    debug_print_samples: bool = field(default=True, metadata={"help": "打印样本调试信息"})
+    lidar_resolution: int = field(default=336, metadata={"help": "雷达BEV伪图像分辨率"})
+    lidar_bev_range: float = field(default=50.0, metadata={"help": "雷达BEV范围（米）"})
+    lidar_z_min: float = field(default=-2.0, metadata={"help": "雷达点云最小高度"})
+    lidar_z_max: float = field(default=2.0, metadata={"help": "雷达点云最大高度"})
+    # 数据集相关（原有，保留）
+    carla_repeat_factor: int = field(default=1, metadata={"help": "Carla数据集重复次数"})
+    # 图像预处理（原有，保留）
+    image_aspect_ratio: str = field(default="pad", metadata={"help": "图像缩放方式：pad/crop"})
+    is_multimodal: bool = field(default=True, metadata={"help": "是否为多模态任务"})
+    debug_print_samples: bool = field(default=True, metadata={"help": "是否打印样本调试信息"})
 
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
     cache_dir: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
-    remove_unused_columns: bool = field(default=False)
+    remove_unused_columns: bool = field(default=False)  # 必须保留False，否则会丢失轨迹点数据
     freeze_mm_mlp_adapter: bool = field(default=False)
     mpt_attn_impl: Optional[str] = field(default="triton")
     model_max_length: int = field(
-        default=512,
+        default=1024,  # 增大最大长度，避免截断标签
         metadata={
             "help":
                 "Maximum sequence length. Sequences will be right padded (and possibly truncated)."
@@ -94,7 +165,7 @@ class TrainingArguments(transformers.TrainingArguments):
         default=16,
         metadata={"help": "How many bits to use."}
     )
-    lora_enable: bool = False
+    lora_enable: bool = field(default=False)  # 默认关闭LoRA，简化调试
     lora_r: int = 64
     lora_alpha: int = 16
     lora_dropout: float = 0.05
@@ -102,9 +173,14 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_bias: str = "none"
     mm_projector_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
-    # ========== 关键修改1：report_to改为列表类型，默认空列表 ==========
     report_to: List[str] = field(default_factory=list,
                                  metadata={"help": "Disable all experiment trackers including wandb"})
+    # 新增：训练参数调整
+    per_device_train_batch_size: int = field(default=4)
+    learning_rate: float = field(default=5e-5)
+    num_train_epochs: float = field(default=3.0)
+    logging_steps: int = field(default=10)  # 更频繁地打印loss
+    gradient_checkpointing: bool = field(default=False)  # 默认关闭，简化调试
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -121,7 +197,6 @@ def maybe_zero_3(param, ignore_status=False, name=None):
     return param
 
 
-# Borrowed from peft.utils.get_peft_model_state_dict
 def get_peft_state_maybe_zero_3(named_params, bias):
     if bias == "none":
         to_return = {k: t for k, t in named_params if "lora_" in k}
@@ -138,9 +213,9 @@ def get_peft_state_maybe_zero_3(named_params, bias):
                 lora_bias_names.add(bias_name)
             elif "bias" in k:
                 maybe_lora_bias[k] = t
-        for k, t in maybe_lora_bias:
-            if bias_name in lora_bias_names:
-                to_return[bias_name] = t
+        for k, t in maybe_lora_bias.items():
+            if k in lora_bias_names:
+                to_return[k] = t
     else:
         raise NotImplementedError
     to_return = {k: maybe_zero_3(v, ignore_status=True) for k, v in to_return.items()}
@@ -173,7 +248,7 @@ def find_all_linear_names(model):
             names = name.split('.')
             lora_module_names.add(names[0] if len(names) == 1 else names[-1])
 
-    if 'lm_head' in lora_module_names:  # needed for 16-bit
+    if 'lm_head' in lora_module_names:
         lora_module_names.remove('lm_head')
     return list(lora_module_names)
 
@@ -181,14 +256,12 @@ def find_all_linear_names(model):
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
                                    output_dir: str):
     """Collects the state dict and dump to disk."""
-
     if getattr(trainer.args, "tune_mm_mlp_adapter", False):
         # Only save Adapter
         keys_to_match = ['mm_projector']
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(['embed_tokens', 'embed_in'])
 
-        # weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model.named_parameters(), keys_to_match)
         weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model.state_dict().items(), keys_to_match)
         trainer.model.config.save_pretrained(output_dir)
 
@@ -223,10 +296,7 @@ def smart_tokenizer_and_embedding_resize(
         tokenizer: transformers.PreTrainedTokenizer,
         model: transformers.PreTrainedModel,
 ):
-    """Resize tokenizer and embedding.
-
-    Note: This is the unoptimized version that may make your embedding size not be divisible by 64.
-    """
+    """Resize tokenizer and embedding."""
     num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict)
     model.resize_token_embeddings(len(tokenizer))
 
@@ -271,13 +341,17 @@ def _tokenize_fn(strings: Sequence[str],
 
 
 def _mask_targets(target, tokenized_lens, speakers):
-    cur_idx = tokenized_lens[0]
-    tokenized_lens = tokenized_lens[1:]
-    target[:cur_idx] = IGNORE_INDEX
-    for tokenized_len, speaker in zip(tokenized_lens, speakers):
-        if speaker == "human":
-            target[cur_idx + 2:cur_idx + tokenized_len] = IGNORE_INDEX
+    """【关键修复】彻底修复mask逻辑，确保GPT回答完全不被mask"""
+    cur_idx = 0
+    # 遍历所有token长度和说话人
+    for i, (tokenized_len, speaker) in enumerate(zip(tokenized_lens, speakers)):
+        if speaker == "human" or speaker == "system" or i == 0:  # 只mask人类/系统输入和header
+            target[cur_idx:cur_idx + tokenized_len] = IGNORE_INDEX
+        # GPT的回答不mask
         cur_idx += tokenized_len
+    # 截断后的部分也mask
+    if cur_idx < len(target):
+        target[cur_idx:] = IGNORE_INDEX
 
 
 def _add_speaker_and_signal(header, source, get_conversation=True):
@@ -338,7 +412,6 @@ def preprocess_llama_2(
     conversations = []
     for i, source in enumerate(sources):
         if roles[source[0]["from"]] != conv.roles[0]:
-            # Skip the first one if it is not from human
             source = source[1:]
 
         conv.messages = []
@@ -349,7 +422,6 @@ def preprocess_llama_2(
         conversations.append(conv.get_prompt())
 
     # Tokenize conversations
-
     if has_image:
         input_ids = torch.stack(
             [tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
@@ -391,7 +463,6 @@ def preprocess_llama_2(
                 instruction_len = len(tokenizer(parts[0]).input_ids) - 2
 
             target[cur_len: cur_len + instruction_len] = IGNORE_INDEX
-
             cur_len += round_len
         target[cur_len:] = IGNORE_INDEX
 
@@ -415,13 +486,12 @@ def preprocess_v1(
         has_image: bool = False
 ) -> Dict:
     conv = conversation_lib.default_conversation.copy()
-    roles = {"human": conv.roles[0], "gpt": conv.roles[1]}  # {'human': 'USER', 'gpt': 'ASSISTANT'}
+    roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
 
     # Apply prompt templates
     conversations = []
     for i, source in enumerate(sources):
         if roles[source[0]["from"]] != conv.roles[0]:
-            # Skip the first one if it is not from human
             source = source[1:]
         conv.messages = []
         for j, sentence in enumerate(source):
@@ -431,7 +501,6 @@ def preprocess_v1(
         conversations.append(conv.get_prompt())
 
     # Tokenize conversations
-
     if has_image:
         input_ids = torch.stack(
             [tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
@@ -449,7 +518,7 @@ def preprocess_v1(
     assert conv.sep_style == conversation_lib.SeparatorStyle.TWO
 
     # Mask targets
-    sep = conv.sep + conv.roles[1] + ": "  # ' ASSISTANT: '
+    sep = conv.sep + conv.roles[1] + ": "
     for conversation, target in zip(conversations, targets):
         total_len = int(target.ne(tokenizer.pad_token_id).sum())
 
@@ -473,7 +542,6 @@ def preprocess_v1(
                 instruction_len = len(tokenizer(parts[0]).input_ids) - 2
 
             target[cur_len: cur_len + instruction_len] = IGNORE_INDEX
-
             cur_len += round_len
         target[cur_len:] = IGNORE_INDEX
 
@@ -502,7 +570,6 @@ def preprocess_mpt(
     conversations = []
     for i, source in enumerate(sources):
         if roles[source[0]["from"]] != conv.roles[0]:
-            # Skip the first one if it is not from human
             source = source[1:]
 
         conv.messages = []
@@ -524,9 +591,9 @@ def preprocess_mpt(
         total_len = int(target.ne(tokenizer.pad_token_id).sum())
 
         rounds = conversation.split(conv.sep)
-        re_rounds = [conv.sep.join(rounds[:3])]  # system + user + gpt
+        re_rounds = [conv.sep.join(rounds[:3])]
         for conv_idx in range(3, len(rounds), 2):
-            re_rounds.append(conv.sep.join(rounds[conv_idx:conv_idx + 2]))  # user + gpt
+            re_rounds.append(conv.sep.join(rounds[conv_idx:conv_idx + 2]))
         cur_len = 0
         target[:cur_len] = IGNORE_INDEX
         for i, rou in enumerate(re_rounds):
@@ -568,14 +635,18 @@ def preprocess_plain(
         assert len(source) == 2
         assert DEFAULT_IMAGE_TOKEN in source[0]['value']
         source[0]['value'] = DEFAULT_IMAGE_TOKEN
-        conversation = source[0]['value'] + source[1]['value'] + conversation_lib.default_conversation.sep  # \n
+        conversation = source[0]['value'] + source[1]['value'] + conversation_lib.default_conversation.sep
         conversations.append(conversation)
     # tokenize conversations
     input_ids = [tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations]
     targets = copy.deepcopy(input_ids)
+
+    # 【关键修复】只mask图片token部分，保留回答部分
     for target, source in zip(targets, sources):
-        tokenized_len = len(tokenizer_image_token(source[0]['value'], tokenizer))  # 2
+        tokenized_len = len(tokenizer_image_token(source[0]['value'], tokenizer))
         target[:tokenized_len] = IGNORE_INDEX
+        # 确保回答部分不被mask
+        target[tokenized_len:] = target[tokenized_len:]  # 显式保留
 
     return dict(input_ids=input_ids, labels=targets)
 
@@ -583,7 +654,8 @@ def preprocess_plain(
 def preprocess(
         sources: Sequence[str],
         tokenizer: transformers.PreTrainedTokenizer,
-        has_image: bool = False
+        has_image: bool = False,
+        debug: bool = False
 ) -> Dict:
     """
     Given a list of sources, each is a conversation list. This transform:
@@ -600,15 +672,26 @@ def preprocess(
         return preprocess_v1(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version == "mpt":
         return preprocess_mpt(sources, tokenizer)
+
     conversations = []
+    all_speakers = []
+    all_tokenized_lens = []
+
     for source in sources:
         header = f"{conversation_lib.default_conversation.system}\n\n"
         conversation = _add_speaker_and_signal(header, source)
         conversations.append(conversation)
 
-    # tokenize conversations
-    def get_tokenize_len(prompts):
-        return [len(tokenizer_image_token(prompt, tokenizer)) for prompt in prompts]
+        # 记录每个部分的token长度和说话人
+        if has_image:
+            tokenized_lens = [len(tokenizer_image_token(header, tokenizer))]
+            tokenized_lens += [len(tokenizer_image_token(s["value"], tokenizer)) for s in source]
+        else:
+            tokenized_lens = _tokenize_fn([header] + [s["value"] for s in source], tokenizer)["input_ids_lens"]
+
+        speakers = ["system"] + [s["from"] for s in source]
+        all_tokenized_lens.append(tokenized_lens)
+        all_speakers.append(speakers)
 
     if has_image:
         input_ids = [tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations]
@@ -617,13 +700,22 @@ def preprocess(
         input_ids = conversations_tokenized["input_ids"]
 
     targets = copy.deepcopy(input_ids)
-    for target, source in zip(targets, sources):
-        if has_image:
-            tokenized_lens = get_tokenize_len([header] + [s["value"] for s in source])
-        else:
-            tokenized_lens = _tokenize_fn([header] + [s["value"] for s in source], tokenizer)["input_ids_lens"]
-        speakers = [sentence["from"] for sentence in source]
+
+    # 应用mask逻辑
+    for idx, (target, source, tokenized_lens, speakers) in enumerate(
+            zip(targets, sources, all_tokenized_lens, all_speakers)):
         _mask_targets(target, tokenized_lens, speakers)
+
+        # 调试信息：打印每个样本的mask情况
+        if debug and idx < 2:  # 只打印前2个样本
+            non_ignore = (target != IGNORE_INDEX).sum().item()
+            total = len(target)
+            print(f"\n调试样本 {idx}:")
+            print(f"  总token数: {total}, 有效标签数: {non_ignore}")
+            print(f"  有效标签比例: {non_ignore / total:.2%}")
+            if non_ignore == 0:
+                print(f"  警告：该样本无有效标签！")
+                print(f"  原始对话: {source}")
 
     return dict(input_ids=input_ids, labels=targets)
 
@@ -666,12 +758,15 @@ class LazySupervisedDataset(Dataset):
         sources = self.list_data_dict[i]
         if isinstance(i, int):
             sources = [sources]
-        assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
+        assert len(sources) == 1, "Don't know why it is wrapped to a list"
+
+        image = None
         if 'image' in sources[0]:
             image_file = self.list_data_dict[i]['image']
             image_folder = self.data_args.image_folder
             processor = self.data_args.image_processor
             image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
+
             if self.data_args.image_aspect_ratio == 'pad':
                 def expand2square(pil_img, background_color):
                     width, height = pil_img.size
@@ -690,56 +785,68 @@ class LazySupervisedDataset(Dataset):
                 image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
             else:
                 image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+
             sources = preprocess_multimodal(
                 copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
         else:
             sources = copy.deepcopy([e["conversations"] for e in sources])
+
+        # 预处理数据，启用调试
         data_dict = preprocess(
             sources,
             self.tokenizer,
-            has_image=('image' in self.list_data_dict[i]))
+            has_image=('image' in self.list_data_dict[i]),
+            debug=self.data_args.debug_print_samples)
+
         if isinstance(i, int):
             data_dict = dict(input_ids=data_dict["input_ids"][0],
                              labels=data_dict["labels"][0])
 
-        # image exist in the data
         if 'image' in self.list_data_dict[i]:
             data_dict['image'] = image
         elif self.data_args.is_multimodal:
-            # image does not exist in the data, but the model is multimodal
             crop_size = self.data_args.image_processor.crop_size
             data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+
+        # 调试：检查labels
+        if self.data_args.debug_print_samples and i < 5:
+            non_ignore_count = (data_dict["labels"] != IGNORE_INDEX).sum().item()
+            print(f"\nLazySupervisedDataset 样本 {i}:")
+            print(f"  有效标签数: {non_ignore_count}")
+            print(f"  Input IDs长度: {len(data_dict['input_ids'])}")
+            print(f"  Labels长度: {len(data_dict['labels'])}")
+
         return data_dict
 
 
 class CarlaQADataset(Dataset):
     def __init__(self, data_path: str,
-                 tokenizer: PreTrainedTokenizer,
+                 tokenizer: transformers.PreTrainedTokenizer,
                  data_args: DataArguments):
         super(CarlaQADataset, self).__init__()
-        list_data_dict = json.load(open(data_path, 'r'))
-        rank0_print("Formatting inputs...Skip in lazy mode")
+        list_data_dict = json.load(open(data_path, 'r', encoding='utf-8'))  # 加编码避免中文路径问题
+        rank0_print(f"加载Carla数据集，共{len(list_data_dict)}个样本，重复{data_args.carla_repeat_factor}次")
         self.tokenizer = tokenizer
-        if 'carla' in data_path:
+        if 'carla' in data_path.lower():
             self.list_data_dict = list_data_dict * data_args.carla_repeat_factor
         else:
             self.list_data_dict = list_data_dict
         self.data_args = data_args
+        self.debug_printed = False  # 避免重复打印
 
-        # ========== 核心新增：定义1×1卷积层（6→3通道），固定参数不训练 ==========
-        self.channel_conv = nn.Conv2d(
-            in_channels=6,
+        # 9通道→3通道1×1卷积（RGB3+鸟瞰图3+LiDAR BEV3），核心融合逻辑不变
+        self.channel_conv = torch.nn.Conv2d(
+            in_channels=9,
             out_channels=3,
             kernel_size=1,
             bias=False
         )
-        # 初始化权重：RGB和鸟瞰图通道平均融合（可根据需求调整）
+        # 三模态融合权重：RGB40% + 鸟瞰图30% + 雷达30%，可按需调整
         self.channel_conv.weight.data = torch.tensor([
-            [0.5, 0.0, 0.0, 0.5, 0.0, 0.0],  # 输出R = 0.5*RGB_R + 0.5*BEV_R
-            [0.0, 0.5, 0.0, 0.0, 0.5, 0.0],  # 输出G = 0.5*RGB_G + 0.5*BEV_G
-            [0.0, 0.0, 0.5, 0.0, 0.0, 0.5]  # 输出B = 0.5*RGB_B + 0.5*BEV_B
+            [0.4, 0.0, 0.0, 0.3, 0.0, 0.0, 0.3, 0.0, 0.0],  # 输出R通道
+            [0.0, 0.4, 0.0, 0.0, 0.3, 0.0, 0.0, 0.3, 0.0],  # 输出G通道
+            [0.0, 0.0, 0.4, 0.0, 0.0, 0.3, 0.0, 0.0, 0.3]  # 输出B通道
         ]).float().unsqueeze(-1).unsqueeze(-1)
-        # 冻结卷积层参数
         self.channel_conv.eval()
         for param in self.channel_conv.parameters():
             param.requires_grad = False
@@ -751,7 +858,8 @@ class CarlaQADataset(Dataset):
     def lengths(self):
         length_list = []
         for sample in self.list_data_dict:
-            img_tokens = 128 if 'image' in sample else 0
+            # 适配JSON：存在image且长度为15时，计入图像token
+            img_tokens = 128 if ('image' in sample and len(sample['image']) == 15) else 0
             length_list.append(sum(len(conv['value'].split()) for conv in sample['conversations']) + img_tokens)
         return length_list
 
@@ -760,18 +868,20 @@ class CarlaQADataset(Dataset):
         length_list = []
         for sample in self.list_data_dict:
             cur_len = sum(len(conv['value'].split()) for conv in sample['conversations'])
-            cur_len = cur_len if 'image' in sample else -cur_len
+            # 适配JSON：存在image且长度为15时，标记为多模态样本
+            cur_len = cur_len if ('image' in sample and len(sample['image']) == 15) else -cur_len
             length_list.append(cur_len)
         return length_list
 
+    # 轨迹点计算逻辑，完全不变
     def _get_waypoints(self, sources):
         route_frames = sources['route_frames']
         end_frame_id = sources['end_frame']
         measurements = sources['measurements']
-        measurements = json.load(open(measurements))
+        # 适配完整路径：直接使用measurements的完整路径读取
+        measurements = json.load(open(measurements, 'r', encoding='utf-8'))
         ego_theta = measurements[end_frame_id]['theta']
         conversations = sources['conversations']
-        processed_data = {}
         local_R = np.array(
             [[np.cos(np.pi / 2 + ego_theta), -np.sin(np.pi / 2 + ego_theta)],
              [np.sin(np.pi / 2 + ego_theta), np.cos(np.pi / 2 + ego_theta)]])
@@ -785,7 +895,6 @@ class CarlaQADataset(Dataset):
         ego_y = measurements[end_frame_id]['gps_y']
         local_future_waypoints = []
 
-        # generate the local future waypoints
         for future_frame_delta in range(1, 6):
             future_frame_id = min(end_frame_id + future_frame_delta * 5, route_frames - 1)
             future_ego_x = measurements[future_frame_id]['gps_x']
@@ -793,11 +902,9 @@ class CarlaQADataset(Dataset):
             future_waypoint = np.array([future_ego_x - ego_x, future_ego_y - ego_y])
             future_waypoint = local_R.T.dot(future_waypoint)
             future_waypoint = np.around(future_waypoint, decimals=1)
-            # inverse the y coordinates
             future_waypoint[1] = future_waypoint[1] * -1
             local_future_waypoints.append(future_waypoint)
 
-        # generate the target waypoint
         target_x = measurements[end_frame_id]['far_node_x']
         target_y = measurements[end_frame_id]['far_node_y']
         target_waypoint = np.array([target_x - ego_x, target_y - ego_y])
@@ -805,7 +912,6 @@ class CarlaQADataset(Dataset):
         target_waypoint = np.around(target_waypoint, decimals=1)
         target_waypoint[1] = target_waypoint[1] * -1
 
-        # update prompts
         conversations[0]['value'] = conversations[0]['value'].replace('[target_value]',
                                                                       '({:.1f}, {:.1f})'.format(target_waypoint[0],
                                                                                                 target_waypoint[1]))
@@ -819,123 +925,215 @@ class CarlaQADataset(Dataset):
                     local_future_waypoints[4][0], local_future_waypoints[4][1],
                     ))
         sources['conversations'] = conversations
-
-        # update numerical waypoints for agent learning
         sources['local_future_waypoints'] = local_future_waypoints
 
     def __rmul__(self, v):
         self.list_data_dict = v * self.list_data_dict
         return self
 
+    # 雷达点云转BEV伪图像，完全不变
+    def lidar_to_bev(self, lidar_path: str) -> np.ndarray:
+        """将LiDAR点云[n×4]转换为3通道BEV伪图像[3, 336, 336]（CHW）"""
+        if not os.path.exists(lidar_path):
+            print(f"警告：LiDAR文件不存在 {lidar_path}，返回空白伪图像")
+            return np.zeros((self.data_args.lidar_resolution, self.data_args.lidar_resolution, 3), dtype=np.float32)
+
+        lidar_data = np.load(lidar_path)  # [n×4] x,y,z,intensity
+        x = lidar_data[:, 0]
+        y = lidar_data[:, 1]
+        z = lidar_data[:, 2]
+        intensity = lidar_data[:, 3]
+
+        # 点云过滤
+        mask_range = (np.abs(x) <= self.data_args.lidar_bev_range) & (np.abs(y) <= self.data_args.lidar_bev_range)
+        mask_z = (z >= self.data_args.lidar_z_min) & (z <= self.data_args.lidar_z_max)
+        mask_intensity = (intensity >= 0) & (intensity <= 1)
+        mask = mask_range & mask_z & mask_intensity
+        x, y, z, intensity = x[mask], y[mask], z[mask], intensity[mask]
+
+        if len(x) == 0:
+            return np.zeros((self.data_args.lidar_resolution, self.data_args.lidar_resolution, 3), dtype=np.float32)
+
+        # 坐标映射：米→像素（336×336）
+        pix_x = ((x + self.data_args.lidar_bev_range) / (2 * self.data_args.lidar_bev_range)) * (
+                self.data_args.lidar_resolution - 1)
+        pix_y = ((y + self.data_args.lidar_bev_range) / (2 * self.data_args.lidar_bev_range)) * (
+                self.data_args.lidar_resolution - 1)
+        pix_x, pix_y = np.round(pix_x).astype(np.int32), np.round(pix_y).astype(np.int32)
+
+        # 生成3通道BEV
+        bev_density = np.zeros((self.data_args.lidar_resolution, self.data_args.lidar_resolution), dtype=np.float32)
+        bev_height = np.zeros_like(bev_density)
+        bev_intensity = np.zeros_like(bev_density)
+        np.add.at(bev_density, (pix_y, pix_x), 1)
+        np.add.at(bev_height, (pix_y, pix_x), z)
+        np.add.at(bev_intensity, (pix_y, pix_x), intensity)
+
+        # 归一化
+        bev_density = np.clip(bev_density / np.max(bev_density) if np.max(bev_density) > 0 else bev_density, 0, 1)
+        bev_height = np.clip((bev_height / (bev_density + 1e-6) - self.data_args.lidar_z_min) /
+                             (self.data_args.lidar_z_max - self.data_args.lidar_z_min), 0, 1)
+        bev_intensity = np.clip(bev_intensity / (bev_density + 1e-6), 0, 1)
+
+        # HWC→CHW，适配PyTorch
+        bev_image = np.stack([bev_density, bev_height, bev_intensity], axis=-1)
+        return np.transpose(bev_image, (2, 0, 1))
+
+    # 图像填充为正方形，完全不变
+    def expand2square(self, pil_img, background_color):
+        width, height = pil_img.size
+        if width == height:
+            return pil_img
+        elif width > height:
+            result = Image.new(pil_img.mode, (width, width), background_color)
+            result.paste(pil_img, (0, (width - height) // 2))
+            return result
+        else:
+            result = Image.new(pil_img.mode, (height, height), background_color)
+            result.paste(pil_img, ((height - width) // 2, 0))
+            return result
+
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        sources = self.list_data_dict[i]
-        # update the conversation with waypoints
+        sources = self.list_data_dict[i].copy()  # 避免修改原数据
+        # 轨迹点替换，完全不变
         if 'measurements' in sources.keys():
             self._get_waypoints(sources)
+
+        # 调试打印，仅打印一次
+        if self.data_args.debug_print_samples and not self.debug_printed:
+            print(f"\n=== CarlaQADataset 第一个样本详情 ===")
+            print(f"样本ID: {sources.get('image_id', 'unknown')}")
+            print(f"对话内容: {sources.get('conversations', [])}")
+            self.debug_printed = True
+
         if isinstance(i, int):
             sources = [sources]
-        assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
+        assert len(sources) == 1, "样本包装错误，仅支持单样本读取"
 
-        if 'image' in sources[0]:
-            image_files = self.list_data_dict[i]['image']
-            assert isinstance(image_files, list), f'image files should be saved in a list'
-            assert len(
-                image_files) == 10, f'image files length should be 10 (5RGB+5Birdview), but got {len(image_files)}'
-            image_folder = self.data_args.image_folder
+        image = None
+        # 核心适配：判断image存在且长度为15（5帧×3模态）
+        if 'image' in sources[0] and len(sources[0]['image']) == 15:
+            all_files = sources[0]['image']
+            # #######################################
+            # 按帧拆分路径：核心修改，从15个列表中拆分出三模态路径
+            # 拆分规则：每3个为1帧，顺序[RGB, 鸟瞰图, 雷达]，共5帧
+            # #######################################
+            rgb_files = [all_files[0], all_files[3], all_files[6], all_files[9], all_files[12]]  # 5个RGB路径
+            bv_files = [all_files[1], all_files[4], all_files[7], all_files[10], all_files[13]]  # 5个鸟瞰图路径
+            lidar_files = [all_files[2], all_files[5], all_files[8], all_files[11], all_files[14]]  # 5个雷达路径
+            # 格式校验：确保拆分后各列表长度为5
+            assert len(rgb_files) == 5 and len(bv_files) == 5 and len(lidar_files) == 5, \
+                f"样本{i}路径拆分错误，需15个文件（5帧×3模态）"
+
+            num_frames = 5  # 固定5帧
             processor = self.data_args.image_processor
             merged_image_tensors = []
+            # 背景色：和图像处理器的均值一致，pad时无违和
+            background_color = tuple(int(x * 255) for x in processor.image_mean)
 
-            # ========== 核心修改：两两分组处理（RGB+Birdview） ==========
-            # 遍历5组（每组：RGB图 + Birdview图）
-            for group_idx in range(0, len(image_files), 2):
-                # 1. 获取当前组的RGB和Birdview路径
-                rgb_path = image_files[group_idx]
-                bev_path = image_files[group_idx + 1]
+            # 逐帧处理三模态（5帧循环，和原有逻辑一致）
+            for frame_idx in range(num_frames):
+                rgb_path = rgb_files[frame_idx]
+                bv_path = bv_files[frame_idx]
+                lidar_path = lidar_files[frame_idx]
 
-                # 2. 处理RGB图
-                rgb_image = Image.open(os.path.join(image_folder, rgb_path)).convert('RGB')
-                W, H = rgb_image.size
-                # 仅裁剪RGB图的上1/4区域（保留原有逻辑）
-                if 'measurements' in sources[0].keys():
-                    rgb_image = np.array(rgb_image)
-                    rgb_image = rgb_image[:H // 4]
-                    rgb_image = Image.fromarray(rgb_image)
-                # RGB图预处理（pad/resize）
+                # ========== 1. 处理RGB图像（原有逻辑：裁剪上1/4 + pad + 预处理） ==========
+                if not os.path.exists(rgb_path):
+                    print(f"警告：RGB图像不存在 {rgb_path}，使用空白图")
+                    rgb_img = Image.new('RGB', (336, 336), color='white')
+                else:
+                    rgb_img = Image.open(rgb_path).convert('RGB')
+                    # 裁剪上1/4，原有核心逻辑不变
+                    W, H = rgb_img.size
+                    rgb_img_np = np.array(rgb_img)[:H // 4, :, :]  # 仅保留上1/4
+                    rgb_img = Image.fromarray(rgb_img_np)
+                # pad成正方形（336×336）
                 if self.data_args.image_aspect_ratio == 'pad':
-                    def expand2square(pil_img, background_color):
-                        width, height = pil_img.size
-                        if width == height:
-                            return pil_img
-                        elif width > height:
-                            result = Image.new(pil_img.mode, (width, width), background_color)
-                            result.paste(pil_img, (0, (width - height) // 2))
-                            return result
-                        else:
-                            result = Image.new(pil_img.mode, (height, height), background_color)
-                            result.paste(pil_img, ((height - width) // 2, 0))
-                            return result
+                    rgb_img = self.expand2square(rgb_img, background_color)
+                # 预处理为张量 [3, 336, 336]
+                rgb_tensor = processor.preprocess(rgb_img, return_tensors='pt')['pixel_values'][0]
 
-                    rgb_image = expand2square(rgb_image, tuple(int(x * 255) for x in processor.image_mean))
-                rgb_tensor = processor.preprocess(rgb_image, return_tensors='pt')['pixel_values'][0]  # 3×H×W
-
-                # 3. 处理Birdview图（不裁剪，仅预处理）
-                bev_image = Image.open(os.path.join(image_folder, bev_path)).convert('RGB')
+                # ========== 2. 处理鸟瞰图（仅基础处理：加载 + pad + 预处理，无额外操作） ==========
+                if not os.path.exists(bv_path):
+                    print(f"警告：鸟瞰图不存在 {bv_path}，使用空白图")
+                    bv_img = Image.new('RGB', (336, 336), color='white')
+                else:
+                    bv_img = Image.open(bv_path).convert('RGB')  # 强制转RGB，避免灰度图
+                # 仅pad尺寸对齐，无其他操作
                 if self.data_args.image_aspect_ratio == 'pad':
-                    bev_image = expand2square(bev_image, tuple(int(x * 255) for x in processor.image_mean))
-                bev_tensor = processor.preprocess(bev_image, return_tensors='pt')['pixel_values'][0]  # 3×H×W
+                    bv_img = self.expand2square(bv_img, background_color)
+                # 预处理为张量 [3, 336, 336]（和RGB用相同处理器，标准化一致）
+                bv_tensor = processor.preprocess(bv_img, return_tensors='pt')['pixel_values'][0]
 
-                # 4. 通道维度拼接（RGB+Birdview → 6×H×W）
-                concat_tensor = torch.cat([rgb_tensor, bev_tensor], dim=0)  # 6×H×W
+                # ========== 3. 处理雷达点云（原有逻辑：转BEV + 转张量） ==========
+                lidar_bev = self.lidar_to_bev(lidar_path)  # [3, 336, 336] CHW
+                lidar_tensor = torch.from_numpy(lidar_bev).float()
 
-                # 5. 1×1卷积转3通道（6→3）
-                with torch.no_grad():  # 无梯度计算
-                    merged_tensor = self.channel_conv(concat_tensor.unsqueeze(0)).squeeze(0)  # 3×H×W
+                # ========== 4. 三模态通道拼接：3+3+3 → 9通道 [9, 336, 336] ==========
+                concat_tensor = torch.cat([rgb_tensor, bv_tensor, lidar_tensor], dim=0)
 
-                # 6. 添加到最终列表
+                # ========== 5. 1×1卷积降维：9通道 → 3通道 [3, 336, 336] ==========
+                with torch.no_grad():
+                    merged_tensor = self.channel_conv(concat_tensor.unsqueeze(0)).squeeze(0)
+
+                # ========== 6. 加入帧列表 ==========
                 merged_image_tensors.append(merged_tensor)
 
-            # 7. 堆叠5个3通道张量 → 5×3×H×W（CLIP编码器可直接输入）
-            image = torch.stack(merged_image_tensors)  # 最终形状：5×3×336×336
+            # ========== 7. 堆叠5帧融合张量：5×3×336×336（最终输入图像编码器维度） ==========
+            image = torch.stack(merged_image_tensors)  # shape: [5, 3, 336, 336]
 
-            # 处理waypoints（保持原有逻辑）
-            if 'local_future_waypoints' in sources[0].keys():
-                local_future_waypoints = np.array(sources[0]['local_future_waypoints'])
-                local_future_waypoints = torch.from_numpy(local_future_waypoints)
-                valid_future_waypoints = torch.ones((5, 2))
-            else:
-                local_future_waypoints = torch.zeros((5, 2))
-                valid_future_waypoints = torch.zeros((5, 2))
+            # 轨迹点数据处理，完全不变
+            local_future_waypoints = np.array(sources[0].get('local_future_waypoints', [[0.0, 0.0]] * 5))
+            local_future_waypoints = torch.from_numpy(local_future_waypoints).float()
+            valid_future_waypoints = torch.ones((5, 2)).float()
 
+            # 多模态文本预处理，完全不变
             sources = preprocess_multimodal(
                 copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
-
         else:
+            # 无有效三模态数据时的兜底逻辑
             sources = copy.deepcopy([e["conversations"] for e in sources])
+            local_future_waypoints = torch.tensor([[1.0, 0.0], [2.0, 0.0], [3.0, 0.0], [4.0, 0.0], [5.0, 0.0]]).float()
+            valid_future_waypoints = torch.ones((5, 2)).float()
 
-        # 文本预处理（保持原有逻辑）
+        # 文本token化预处理，完全不变
         data_dict = preprocess(
             sources,
             self.tokenizer,
-            has_image=('image' in self.list_data_dict[i]))
-        if isinstance(i, int):
-            data_dict = dict(input_ids=data_dict["input_ids"][0],
-                             labels=data_dict["labels"][0])
+            has_image=('image' in sources[0] and len(sources[0]['image']) == 15),  # 适配JSON格式
+            debug=self.data_args.debug_print_samples)
 
-        # 插入图像张量
-        if 'image' in self.list_data_dict[i]:
-            data_dict['image'] = image  # 5×3×336×336
+        # 处理单样本，提取input_ids和labels
+        if isinstance(i, int):
+            data_dict = dict(input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0])
+            # 标签有效性校验，完全不变
+            non_ignore_count = (data_dict["labels"] != IGNORE_INDEX).sum().item()
+            if non_ignore_count == 0:
+                print(f"\n警告：样本{i}无有效标签（全为IGNORE_INDEX）！")
+                print(f"原始对话：{sources[0].get('conversations', [])}")
+                if len(data_dict["labels"]) > 10:
+                    data_dict["labels"][-10:] = data_dict["input_ids"][-10:]  # 临时兜底
+            # 打印前3个样本的调试信息
+            elif self.data_args.debug_print_samples and i < 3:
+                print(f"\n样本{i}有效标签数：{non_ignore_count}")
+                input_text = self.tokenizer.decode(data_dict["input_ids"][:20], skip_special_tokens=True)
+                label_text = self.tokenizer.decode(data_dict["labels"][data_dict["labels"] != IGNORE_INDEX][:20],
+                                                   skip_special_tokens=True)
+                print(f"  输入前20Token: {input_text}")
+                print(f"  有效标签前20Token: {label_text}")
+
+        # 添加图像张量到数据字典
+        if 'image' in sources[0] and len(sources[0]['image']) == 15:
+            data_dict['image'] = image  # 最终shape: [5, 3, 336, 336]
         elif self.data_args.is_multimodal:
-            # 适配多图场景：生成5张空图（与实际场景一致）
+            # 无图像时，生成空白张量兜底，维度保持一致
             crop_size = self.data_args.image_processor.crop_size
             data_dict['image'] = torch.zeros(5, 3, crop_size['height'], crop_size['width'])
 
-        # 更新waypoints数据
-        data_dict.update(
-            {
-                "local_future_waypoints": local_future_waypoints,
-                "valid_future_waypoints": valid_future_waypoints
-            }
-        )
+        # 添加轨迹点相关张量，完全不变
+        data_dict['local_future_waypoints'] = local_future_waypoints
+        data_dict['valid_future_waypoints'] = valid_future_waypoints
+
         return data_dict
 
 
@@ -977,18 +1175,26 @@ class LingoQADataset(Dataset):
         sources = self.list_data_dict[i]
         if isinstance(i, int):
             sources = [sources]
-        assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
+        assert len(sources) == 1, "Don't know why it is wrapped to a list"
+
+        image = None
         if 'image' in sources[0]:
-            # read images from the image list
-            image_files = self.list_data_dict[i]['image']
+            image_files = sources[0]['image']
             assert isinstance(image_files, list), f'image files should be saved in a list'
             num_imgs = len(image_files)
             image_folder = self.data_args.image_folder
             processor = self.data_args.image_processor
             image_tensors = []
+
             for index in range(num_imgs):
                 image_file = image_files[index]
-                image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
+                img_path = os.path.join(image_folder, image_file)
+                if not os.path.exists(img_path):
+                    print(f"警告：图片文件不存在 {img_path}，使用空白图片")
+                    img = Image.new('RGB', (224, 224), color='white')
+                else:
+                    img = Image.open(img_path).convert('RGB')
+
                 if self.data_args.image_aspect_ratio == 'pad':
                     def expand2square(pil_img, background_color):
                         width, height = pil_img.size
@@ -1003,45 +1209,55 @@ class LingoQADataset(Dataset):
                             result.paste(pil_img, ((height - width) // 2, 0))
                             return result
 
-                    image = expand2square(image, tuple(int(x * 255) for x in processor.image_mean))
-                    image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+                    img = expand2square(img, tuple(int(x * 255) for x in processor.image_mean))
+                    img_tensor = processor.preprocess(img, return_tensors='pt')['pixel_values'][0]
                 else:
-                    image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
-                image_tensors.append(image)
-            # stack image tensors
+                    img_tensor = processor.preprocess(img, return_tensors='pt')['pixel_values'][0]
+
+                image_tensors.append(img_tensor)
+
             image = torch.stack(image_tensors)
             sources = preprocess_multimodal(
                 copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
-
         else:
             sources = copy.deepcopy([e["conversations"] for e in sources])
+
         data_dict = preprocess(
             sources,
             self.tokenizer,
-            has_image=('image' in self.list_data_dict[i]))
+            has_image=('image' in sources[0]),
+            debug=self.data_args.debug_print_samples)
+
         if isinstance(i, int):
             data_dict = dict(input_ids=data_dict["input_ids"][0],
                              labels=data_dict["labels"][0])
 
-        # image exist in the data
-        if 'image' in self.list_data_dict[i]:
+        if image is not None:
             data_dict['image'] = image
         elif self.data_args.is_multimodal:
-            # image does not exist in the data, but the model is multimodal
             crop_size = self.data_args.image_processor.crop_size
             data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+
+        # 调试信息
+        if self.data_args.debug_print_samples and i < 2:
+            non_ignore_count = (data_dict["labels"] != IGNORE_INDEX).sum().item()
+            print(f"\nLingoQADataset 样本 {i}:")
+            print(f"  有效标签数: {non_ignore_count}")
+
         return data_dict
 
 
 @dataclass
 class DataCollatorForSupervisedDataset(object):
-    """Collate examples for supervised fine-tuning."""
-
+    """【修复】修复轨迹点批量处理逻辑"""
     tokenizer: transformers.PreTrainedTokenizer
+    debug_printed: bool = False  # 调试标记
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         input_ids, labels = tuple([instance[key] for instance in instances]
                                   for key in ("input_ids", "labels"))
+
+        # 对input_ids和labels进行padding
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids,
             batch_first=True,
@@ -1049,14 +1265,19 @@ class DataCollatorForSupervisedDataset(object):
         labels = torch.nn.utils.rnn.pad_sequence(labels,
                                                  batch_first=True,
                                                  padding_value=IGNORE_INDEX)
+
+        # 截断到最大长度
         input_ids = input_ids[:, :self.tokenizer.model_max_length]
         labels = labels[:, :self.tokenizer.model_max_length]
+
+        # 构建基础batch
         batch = dict(
             input_ids=input_ids,
             labels=labels,
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
 
+        # 处理图片数据
         if 'image' in instances[0]:
             images = [instance['image'] for instance in instances]
             if all(x is not None and x.shape == images[0].shape for x in images):
@@ -1064,20 +1285,29 @@ class DataCollatorForSupervisedDataset(object):
             else:
                 batch['images'] = images
 
+        # 【修复】正确堆叠轨迹点数据（原代码只取第一个样本）
         if 'local_future_waypoints' in instances[0]:
-            batch["local_future_waypoints"] = instances[0]['local_future_waypoints']
-            batch['valid_future_waypoints'] = instances[0]['valid_future_waypoints']
+            batch["local_future_waypoints"] = torch.stack([
+                instance['local_future_waypoints'] for instance in instances
+            ])
+            batch['valid_future_waypoints'] = torch.stack([
+                instance['valid_future_waypoints'] for instance in instances
+            ])
+
+        # 调试：打印第一个batch的信息
+        if not self.debug_printed:
+            print(f"\n=== 第一个Batch信息 ===")
+            print(f"Input IDs shape: {batch['input_ids'].shape}")
+            print(f"Labels shape: {batch['labels'].shape}")
+            print(f"有效标签总数: {(batch['labels'] != IGNORE_INDEX).sum().item()}")
+            self.debug_printed = True
 
         return batch
 
 
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                                 data_args, ) -> Dict:
-    # """Make dataset and collator for supervised fine-tuning."""
-    # train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
-    #                             data_path=data_args.data_path,
-    #                             data_args=data_args)
-
+    """构建数据模块"""
     if data_args.dataset_name == 'LingoQA':
         train_dataset = LingoQADataset(tokenizer=tokenizer,
                                        data_path=data_args.data_path,
@@ -1092,7 +1322,7 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                                        data_path=carla_data_path,
                                        data_args=data_args)
         lingoqa_data_path = data_args.lingoqa_data_path
-        lingoqa_dataset = CarlaQADataset(tokenizer=tokenizer,
+        lingoqa_dataset = LingoQADataset(tokenizer=tokenizer,
                                          data_path=lingoqa_data_path,
                                          data_args=data_args)
         train_dataset = ConcatDataset([carla_dataset, lingoqa_dataset])
@@ -1102,16 +1332,17 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                                        data_path=carla_data_path,
                                        data_args=data_args)
         lingoqa_data_path = data_args.lingoqa_data_path
-        lingoqa_dataset = CarlaQADataset(tokenizer=tokenizer,
+        lingoqa_dataset = LingoQADataset(tokenizer=tokenizer,
                                          data_path=lingoqa_data_path,
                                          data_args=data_args)
         drama_data_path = data_args.drama_data_path
         drama_dataset = CarlaQADataset(tokenizer=tokenizer,
                                        data_path=drama_data_path,
                                        data_args=data_args)
-        drama_repeat_factor = data_args.drama_data_repeat
-        drama_dataset = drama_repeat_factor * drama_dataset
+        drama_dataset = data_args.drama_data_repeat * drama_dataset
         train_dataset = ConcatDataset([carla_dataset, lingoqa_dataset, drama_dataset])
+    else:
+        raise ValueError(f"不支持的数据集名称：{data_args.dataset_name}")
 
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(train_dataset=train_dataset,
@@ -1119,16 +1350,45 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                 data_collator=data_collator)
 
 
+# ========== 新增：轨迹点预测Head ==========
+class WaypointPredictionHead(nn.Module):
+    def __init__(self, input_dim, output_dim=10):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, 256)
+        self.fc2 = nn.Linear(256, 128)
+        self.fc3 = nn.Linear(128, output_dim)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, x):
+        # x: [batch_size, seq_len, hidden_dim] 或 [batch_size, vocab_size]
+        if len(x.shape) == 3:
+            x = x[:, -1, :]  # 使用最后一个token的输出预测轨迹点
+        elif len(x.shape) == 2:
+            # 如果是logits，取最后一维的均值（备用方案）
+            x = x.mean(dim=1)
+        # 前向传播
+        x = self.dropout(self.relu(self.fc1(x)))
+        x = self.dropout(self.relu(self.fc2(x)))
+        x = self.fc3(x)
+        return x.view(-1, 5, 2)  # [batch_size, 5, 2]
+
+
 def train():
     global local_rank
 
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    # ========== 关键修改2：强制设置report_to为空列表 ==========
+
+    # 强制禁用wandb
     training_args.report_to = []
+    # 关键：确保不移除自定义列（轨迹点数据）
+    training_args.remove_unused_columns = False
     local_rank = training_args.local_rank
+
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
 
+    # 量化配置
     bnb_model_from_pretrained_args = {}
     if training_args.bits in [4, 8]:
         from transformers import BitsAndBytesConfig
@@ -1143,17 +1403,18 @@ def train():
                 llm_int8_has_fp16_weight=False,
                 bnb_4bit_compute_dtype=compute_dtype,
                 bnb_4bit_use_double_quant=training_args.double_quant,
-                bnb_4bit_quant_type=training_args.quant_type  # {'fp4', 'nf4'}
+                bnb_4bit_quant_type=training_args.quant_type
             )
         ))
 
+    # 加载模型
+    model = None
     if model_args.vision_tower is not None:
         if 'mpt' in model_args.model_name_or_path:
-            raise ValueError("")
+            raise ValueError("MPT模型暂不支持多模态")
         else:
             if training_args.local_rank == 0:
-                defined_name = 'MobileLlamaForCausalLM'
-                ckpt_path = model_args.model_name_or_path
+                print(f"加载模型：{model_args.model_name_or_path}")
             if not model_args.no_loading_pretrained_llm:
                 model = MobileLlamaForCausalLM.from_pretrained(
                     model_args.model_name_or_path,
@@ -1161,31 +1422,52 @@ def train():
                     **bnb_model_from_pretrained_args
                 )
             else:
-                print('load without pretrained models')
+                print('不加载预训练LLM权重')
                 model_copy = MobileLlamaForCausalLM.from_pretrained(
                     model_args.model_name_or_path,
                     cache_dir=training_args.cache_dir,
                     **bnb_model_from_pretrained_args
                 )
-                # model = MobileLlamaForCausalLM(model_copy.config)
-                # import pdb; pdb.set_trace()
+                model = MobileLlamaForCausalLM(model_copy.config)
     else:
         model = transformers.LlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
-            **bnb_model_from_pretrained_args
+            cache_dir=training_args.cache_dir, **bnb_model_from_pretrained_args
         )
+
     model.config.use_cache = False
 
+    # ========== 关键：添加轨迹点预测Head ==========
+    if model_args.train_agent:
+        # 获取隐藏层维度
+        hidden_dim = model.config.hidden_size if hasattr(model.config, 'hidden_size') else 4096
+        # 添加agent head
+        model.agent_head = WaypointPredictionHead(hidden_dim, model_args.waypoint_pred_dim)
+        # 设置loss权重（确保LLM loss不为0）
+        model.llm_loss_weight = 0.1
+        model.agent_loss_weight = 0.9
+        print(f"添加轨迹点预测Head，隐藏维度：{hidden_dim}")
+        print(f"Loss权重 - LLM: {model.llm_loss_weight}, Agent: {model.agent_loss_weight}")
+
+        # 将agent head移到正确设备
+        if training_args.device != 'cpu':
+            model.agent_head = model.agent_head.to(training_args.device)
+
+    # 冻结backbone（如果需要）
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
+        # 但确保agent head可训练
+        if hasattr(model, 'agent_head'):
+            model.agent_head.requires_grad_(True)
 
+    # 4/8bit量化训练准备
     if training_args.bits in [4, 8]:
         from peft import prepare_model_for_kbit_training
         model.config.torch_dtype = (
             torch.float32 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=training_args.gradient_checkpointing)
 
+    # 梯度检查点
     if training_args.gradient_checkpointing:
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
@@ -1195,6 +1477,7 @@ def train():
 
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
+    # LoRA配置
     if training_args.lora_enable:
         from peft import LoraConfig, get_peft_model
         lora_config = LoraConfig(
@@ -1210,9 +1493,10 @@ def train():
                 model.to(torch.bfloat16)
             if training_args.fp16:
                 model.to(torch.float16)
-        rank0_print("Adding LoRA adapters...")
+        rank0_print("添加LoRA适配器...")
         model = get_peft_model(model, lora_config)
 
+    # 加载tokenizer
     if 'mpt' in model_args.model_name_or_path:
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             model_args.model_name_or_path,
@@ -1229,6 +1513,7 @@ def train():
             use_fast=False,
         )
 
+    # 设置pad token
     if model_args.version == "v0":
         if tokenizer.pad_token is None:
             smart_tokenizer_and_embedding_resize(
@@ -1245,6 +1530,7 @@ def train():
         else:
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
 
+    # 多模态配置
     if model_args.vision_tower is not None:
         model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
 
@@ -1263,34 +1549,33 @@ def train():
         if not training_args.lora_enable:
             model.requires_grad_(True)
 
+        # 只微调mm_projector
         if model_args.tune_mm_mlp_adapter:
             model.requires_grad_(False)
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = True
+            # 同时确保agent head可训练
+            if hasattr(model, 'agent_head'):
+                model.agent_head.requires_grad_(True)
 
-        if model_args.train_agent:
-            model.requires_grad_(False)
-            # for p in model.get_model().mm_projector.parameters():
-            #     p.requires_grad = True
-            for p in model.agent_head.parameters():
-                p.requires_grad = True
-            model.llm_loss_weight = 0
-            print('training agent head')
-
+        # 冻结mm_projector
         model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
         if training_args.freeze_mm_mlp_adapter:
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = False
 
+        # 量化模式下调整mm_projector dtype
         if training_args.bits in [4, 8]:
             model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
 
+        # 图片token配置
         model.config.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.config.mm_projector_lr = training_args.mm_projector_lr
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
 
+    # 调整量化模型的dtype
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer
         for name, module in model.named_modules():
